@@ -4,26 +4,14 @@ scada:
 
 plcs:
   - id: "PLC_PUMP_1"
-    role: "actuator"
-    type: "pump"
     element_id: "PUMP1"
     ip: "10.0.0.1"
-    logic:
-      mode: "native_inp"
+
 
   - id: "PLC_PUMP_2"
-    role: "actuator"
-    type: "pump"
     element_id: "PUMP2"
     ip: "10.0.0.11"
-    logic:
-      mode: "native_inp"
 
   - id: "PLC_TANK_1"
-    role: "sensor"
-    type: "tank"
     element_id: "TANK"
     ip: "10.0.0.3"
-    logic:
-      mode: "report_level"
-      report_interval_steps: 1

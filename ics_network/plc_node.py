@@ -108,4 +108,4 @@ class PlcLogic:
             if "valve_setting" in responses:
                 return {element_id: responses["valve_setting"]}
 
-        return {element_id: "AUTO"}
+        return {}

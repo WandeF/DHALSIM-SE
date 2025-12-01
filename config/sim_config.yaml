@@ -1,6 +1,7 @@
 simulation:
+  mode: "closed_loop"   # closed_loop or open_loop
   duration_hours: 24
-  step_minutes: 5
+  step_minutes: 15
   start_clock_time: "00:00"
 
 network:

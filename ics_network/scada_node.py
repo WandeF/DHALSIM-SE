@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, List
+import logging
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ScadaServer:
@@ -78,32 +81,103 @@ class ScadaServer:
     def _ingest_sensor(self, cfg: Dict, observations: Dict) -> None:
         if cfg.get("type") == "tank":
             level = observations.get("tank_level")
+            if level is None:
+                level = observations.get("level")
             if level is not None:
                 self.latest_sensors[cfg["element_id"]] = float(level)
 
+    @staticmethod
+    def _normalize_status(status: Optional[str]) -> Optional[str]:
+        if status is None:
+            return None
+        s = str(status).upper()
+        if s in {"OPEN", "ON", "1", "TRUE"}:
+            return "OPEN"
+        if s in {"CLOSED", "OFF", "0", "FALSE"}:
+            return "CLOSED"
+        return None
+
+    def _last_command_for_element(self, element_id: str, elem_type: str) -> Optional[str]:
+        if elem_type == "pump":
+            return self._normalize_status(self.pump_commands.get(element_id))
+        if elem_type == "valve":
+            return self._normalize_status(self.valve_commands.get(element_id))
+        return None
+
+    def _select_rule_action(self, rules: List[Dict], level: float, default_action: Optional[str]) -> Optional[str]:
+        matching = []
+        for rule in rules:
+            comparator = str(rule.get("comparator", "")).upper()
+            action = str(rule.get("action", "")).upper()
+            threshold = float(rule.get("threshold", 0))
+            priority = int(rule.get("priority", 0))
+            rule_index = int(rule.get("rule_index", 0))
+
+            condition_met = False
+            if comparator == "BELOW":
+                condition_met = level < threshold
+            elif comparator == "ABOVE":
+                condition_met = level > threshold
+
+            if condition_met:
+                matching.append((priority, rule_index, action))
+
+        if not matching:
+            return default_action
+
+        # Higher priority wins; tie-breaker is later rule_index.
+        _, _, chosen_action = max(matching, key=lambda x: (x[0], x[1]))
+        return chosen_action
+
     def _dispatch_actuator_logic(self, cfg: Dict, observations: Dict):
         """
-        Map INP-derived control patterns to simple modes:
-        open_if_below / close_if_below / open_if_above / close_if_above.
+        Evaluate EPANET-style rules per element. When no rule matches, keep the
+        previous state (last command if any, else the current physical status).
         """
         logic = cfg.get("logic", {})
-        mode = logic.get("mode")
         node_id = logic.get("node_id")
-        threshold = float(logic.get("threshold", 0))
+        element_id = cfg.get("element_id")
+        elem_type = cfg.get("type")
 
-        # Use current observation; fall back to last known sensor value.
+        # Latest measured level.
         level = observations.get("level")
         if level is None and node_id:
             level = self.latest_sensors.get(node_id)
+
+        # Normalized current status and last command.
+        current_status = self._normalize_status(observations.get("current_status"))
+        last_command = self._last_command_for_element(element_id, elem_type)
+        fallback = last_command or current_status
+
+        rules = logic.get("rules") or []
+        if rules:
+            if level is None:
+                return fallback
+            action = self._select_rule_action(rules, float(level), fallback)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "SCADA rule eval element=%s level=%s -> %s (fallback=%s)",
+                    element_id,
+                    level,
+                    action,
+                    fallback,
+                )
+            return action
+
+        # Legacy simple modes (kept for compatibility).
+        mode = logic.get("mode")
+        threshold = float(logic.get("threshold", 0))
+        if level is None and node_id:
+            level = self.latest_sensors.get(node_id)
         if level is None:
-            return None
+            return fallback
 
         if mode == "open_if_below":
-            return "OPEN" if level < threshold else "CLOSED"
+            return "OPEN" if level < threshold else fallback
         if mode == "close_if_below":
-            return "CLOSED" if level < threshold else "OPEN"
+            return "CLOSED" if level < threshold else fallback
         if mode == "open_if_above":
-            return "OPEN" if level > threshold else "CLOSED"
+            return "OPEN" if level > threshold else fallback
         if mode == "close_if_above":
-            return "CLOSED" if level > threshold else "OPEN"
-        return None
+            return "CLOSED" if level > threshold else fallback
+        return fallback

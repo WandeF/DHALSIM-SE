@@ -8,14 +8,6 @@ from wntr.network import WaterNetworkModel
 from physical.controls_parser import parse_controls_from_inp, ControlRule
 
 
-LOGIC_MAP = {
-    ("BELOW", "OPEN"): "open_if_below",
-    ("BELOW", "CLOSED"): "close_if_below",
-    ("ABOVE", "OPEN"): "open_if_above",
-    ("ABOVE", "CLOSED"): "close_if_above",
-}
-
-
 def _infer_element_type(model: WaterNetworkModel, link_id: str) -> str:
     link = model.get_link(link_id)
     klass = link.__class__.__name__.lower()
@@ -52,34 +44,48 @@ def build_runtime_plc_config(user_plc_config: Dict, inp_path: Path | str) -> Dic
     runtime_plcs: List[Dict] = []
     sensor_nodes: set[str] = set()
 
+    # Group control rules by actuator link so we can evaluate them together later.
+    rules_by_link: Dict[str, List[ControlRule]] = {}
     for ctl in controls:
-        mode = LOGIC_MAP.get((ctl.comparator, ctl.action))
-        if mode is None:
-            continue
+        rules_by_link.setdefault(ctl.link_id, []).append(ctl)
 
-        minimal = user_by_elem.get(ctl.link_id)
+    for link_id, rules in rules_by_link.items():
+        minimal = user_by_elem.get(link_id)
         if minimal is None:
             # If no user entry, synthesize a PLC id/ip placeholder.
             minimal = {
-                "id": f"PLC_{ctl.link_id}",
-                "element_id": ctl.link_id,
+                "id": f"PLC_{link_id}",
+                "element_id": link_id,
                 "ip": "10.0.0.250",
             }
+
+        sensor_nodes.update({r.node_id for r in rules})
+
+        logic_rules = [
+            {
+                "node_id": r.node_id,
+                "comparator": r.comparator,
+                "threshold": r.threshold,
+                "action": r.action,
+                "priority": r.priority,
+                "rule_index": r.rule_index,
+            }
+            for r in rules
+        ]
 
         plc_entry = {
             "id": minimal["id"],
             "element_id": minimal["element_id"],
             "ip": minimal.get("ip", "10.0.0.250"),
             "role": "actuator",
-            "type": _infer_element_type(model, ctl.link_id),
+            "type": _infer_element_type(model, link_id),
             "logic": {
-                "mode": mode,
-                "node_id": ctl.node_id,
-                "threshold": ctl.threshold,
+                "mode": "rule_list",
+                "node_id": rules[0].node_id if rules else None,
+                "rules": logic_rules,
             },
         }
         runtime_plcs.append(plc_entry)
-        sensor_nodes.add(ctl.node_id)
 
     # Add sensor PLCs for conditioning nodes if missing.
     existing_sensor_nodes = {plc["element_id"] for plc in runtime_plcs if plc.get("role") == "sensor"}
