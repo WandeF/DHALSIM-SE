@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List
 
 from wntr.network import WaterNetworkModel
 from wntr.sim import WNTRSimulator
@@ -10,12 +10,12 @@ logger = logging.getLogger(__name__)
 
 class PhysicalSimulator:
     """
-    Thin wrapper around WNTR that exposes a per-step API.
+    Step-based wrapper around a precomputed WNTR simulation.
 
-    Note: This mini version runs a short hydraulic horizon every step using the
-    current actuator settings. It does not yet preserve full hydraulic state
-    between steps; for control design that is usually sufficient and keeps the
-    code small. Swap in a more advanced scheme later if you need warm-starting.
+    We run a full EPANET simulation once in initialize() using the configured
+    duration/step, then each step() simply reads the current timestep from the
+    stored WNTR results. Tank levels are derived from node head minus elevation
+    (never from static init_level).
     """
 
     def __init__(self, inp_path: str, duration_hours: float, step_minutes: float) -> None:
@@ -26,45 +26,80 @@ class PhysicalSimulator:
         self.duration_seconds = int(duration_hours * 3600)
 
         self.current_time = 0
+        self.step_idx = 0
 
-        # Most recent actuator commands that will be applied to the model.
+        self.results = None
+        self.time_index: List[int] = []
+
+        # Cached lists for convenience.
+        self.tank_ids: List[str] = []
+        self.pump_ids: List[str] = []
+        self.valve_ids: List[str] = []
+
+        # Commands are cached for logging only; hydraulics are open-loop.
         self.pump_commands: Dict[str, str] = {}
         self.valve_commands: Dict[str, float] = {}
-        self.initial_tank_levels: Dict[str, float] = {}
+
+        # Last known physical states for reference/logging.
         self.last_tank_levels: Dict[str, float] = {}
+        self.last_pump_states: Dict[str, str] = {}
+        self.last_valve_settings: Dict[str, float] = {}
+
+        # Base model used for elevations and element metadata.
+        self._base_model: WaterNetworkModel | None = None
 
     def initialize(self) -> None:
         if not self.inp_path.exists():
             raise FileNotFoundError(f"Missing EPANET file: {self.inp_path}")
-        self.current_time = 0
-        # Capture initial tank levels from the template network.
+
         model = WaterNetworkModel(str(self.inp_path))
-        self.initial_tank_levels = {
-            tank_id: model.get_node(tank_id).init_level for tank_id in model.tank_name_list
-        }
-        self.last_tank_levels = self.initial_tank_levels.copy()
+        model.options.time.duration = self.duration_seconds
+        model.options.time.hydraulic_timestep = self.step_seconds
+        model.options.time.report_timestep = self.step_seconds
+
+        sim = WNTRSimulator(model)
+        self.results = sim.run_sim()
+        self.time_index = list(getattr(self.results, "time", []))
+
+        self.tank_ids = model.tank_name_list
+        self.pump_ids = model.pump_name_list
+        self.valve_ids = model.valve_name_list
+        self._base_model = model
+
+        # Initialize last-known states from the first timestep of results.
+        if self.time_index:
+            t0 = self.time_index[0]
+            self.last_tank_levels = self._read_tank_levels(t0)
+            self.last_pump_states = self._extract_status(self.results, t0, self.pump_ids, {})
+            self.last_valve_settings = self._extract_setting(self.results, t0, self.valve_ids, {})
+
         logger.info(
-            "Loaded network %s (duration=%ss, step=%ss)",
+            "Loaded network %s (duration=%ss, step=%ss, timesteps=%d)",
             self.inp_path,
             self.duration_seconds,
             self.step_seconds,
+            len(self.time_index),
         )
 
     def apply_actuator_commands(
         self, pump_commands: Dict[str, str], valve_commands: Dict[str, float]
     ) -> None:
-        """Update the actuator commands to use for the next step."""
+        """
+        Open-loop note: physical hydraulics are precomputed from the INP controls.
+        We cache commands for logging/analysis only; they do NOT alter the stored
+        WNTR results. To close the loop, rerun hydraulics each step with commands.
+        """
         self.pump_commands = pump_commands.copy()
         self.valve_commands = valve_commands.copy()
 
     def step(self) -> Dict:
         """
-        Advance the physical model by one coarse step.
-
-        Returns a snapshot dictionary with key measurements and actuator status.
+        Return the snapshot at the current timestep from precomputed results.
         """
-        # Stop if we've exceeded the configured duration.
-        if self.current_time >= self.duration_seconds:
+        if self.results is None or not self.time_index:
+            raise RuntimeError("Call initialize() before stepping the simulator.")
+
+        if self.step_idx >= len(self.time_index):
             return {
                 "time": self.current_time,
                 "tanks": {},
@@ -73,100 +108,39 @@ class PhysicalSimulator:
                 "pressures": {},
             }
 
-        model = WaterNetworkModel(str(self.inp_path))
-        model.options.time.duration = self.step_seconds
-        model.options.time.hydraulic_timestep = self.step_seconds
-        # Force reporting at each simulation step so we read the end-of-step state.
-        model.options.time.report_timestep = self.step_seconds
+        t = self.time_index[self.step_idx]
+        tanks = self._read_tank_levels(t)
+        pumps = self._extract_status(self.results, t, self.pump_ids, {})
+        valves = self._extract_setting(self.results, t, self.valve_ids, {})
 
-        self._apply_commands_to_model(model)
-        self._apply_tank_levels(model)
+        self.last_tank_levels = tanks
+        self.last_pump_states = pumps
+        self.last_valve_settings = valves
 
-        sim = WNTRSimulator(model)
-        results = sim.run_sim()
-
-        if not getattr(results, "time", []):
-            logger.warning("Simulation returned no timesteps; skipping step at t=%s", self.current_time)
-            self.current_time += self.step_seconds
-            return {
-                "time": self.current_time,
-                "tanks": {},
-                "pressures": {},
-                "pumps": self.pump_commands.copy(),
-                "valves": self.valve_commands.copy(),
-            }
-
-        # Extract the last timestep (should equal step_seconds).
-        ts = results.time[-1]
-        tank_levels = results.node["pressure"].loc[ts, model.tank_name_list].to_dict()
-        pressures = results.node["pressure"].loc[ts].to_dict()
-        # Track tank levels for the next step's initial conditions.
-        if tank_levels:
-            self.last_tank_levels.update(tank_levels)
-
-        # Pump/valve states from the results frames; fall back to commands if missing.
-        pump_states = self._extract_status(results, ts, model.pump_name_list, self.pump_commands)
-        valve_states = self._extract_setting(results, ts, model.valve_name_list, self.valve_commands)
-
-        self.current_time += self.step_seconds
-        return {
-            "time": self.current_time,
-            "tanks": tank_levels,
-            "pressures": pressures,
-            "pumps": pump_states,
-            "valves": valve_states,
+        snapshot = {
+            "time": t,
+            "tanks": tanks,
+            "pressures": {},  # extend if needed
+            "pumps": pumps,
+            "valves": valves,
         }
 
-    def _apply_commands_to_model(self, model: WaterNetworkModel) -> None:
-        # Pumps
-        for pump_id, status in self.pump_commands.items():
-            if str(status).upper() == "AUTO":
-                continue  # native INP logic governs
+        self.step_idx += 1
+        self.current_time = t
+        return snapshot
 
-            # Remove native controls affecting this pump for this step
-            for ctl_name in list(getattr(model, "control_name_list", []) or []):
-                try:
-                    ctl = model.get_control(ctl_name)
-                    if pump_id in str(ctl):
-                        model.remove_control(ctl_name)
-                except Exception:
-                    continue
-
-            link = model.get_link(pump_id)
-            state = 1 if str(status).upper() in {"OPEN", "ON", "1"} else 0
-            link.initial_status = state
-
-        # Valves
-        for valve_id, setting in self.valve_commands.items():
-            if str(setting).upper() == "AUTO":
+    def _read_tank_levels(self, t) -> Dict[str, float]:
+        levels: Dict[str, float] = {}
+        if self.results is None or self._base_model is None:
+            return levels
+        heads = self.results.node["head"]
+        for tank_id in self.tank_ids:
+            if tank_id not in heads.columns:
                 continue
-
-            for ctl_name in list(getattr(model, "control_name_list", []) or []):
-                try:
-                    ctl = model.get_control(ctl_name)
-                    if valve_id in str(ctl):
-                        model.remove_control(ctl_name)
-                except Exception:
-                    continue
-
-            link = model.get_link(valve_id)
-            try:
-                val = float(setting)
-            except (TypeError, ValueError):
-                val = 0.0
-            link.initial_setting = val
-            try:
-                link.setting = val
-            except AttributeError:
-                pass
-
-    def _apply_tank_levels(self, model: WaterNetworkModel) -> None:
-        for tank_id, level in self.last_tank_levels.items():
-            try:
-                tank = model.get_node(tank_id)
-                tank.init_level = float(level)
-            except Exception:
-                continue
+            head = heads.loc[t, tank_id]
+            elevation = float(self._base_model.get_node(tank_id).elevation)
+            levels[tank_id] = float(head - elevation)
+        return levels
 
     @staticmethod
     def _extract_status(results, ts, ids, fallback: Dict[str, str]) -> Dict[str, str]:

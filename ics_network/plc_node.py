@@ -97,11 +97,16 @@ class PlcLogic:
         element_id = self.cfg.get("element_id")
         responses = self.last_reply.get("responses", {})
 
-        override = responses.get("override_action")
-        if override is not None:
-            return {element_id: override}
+        if self.cfg.get("type") == "pump":
+            if "override_action" in responses:
+                return {element_id: responses["override_action"]}
+            if "pump_command" in responses:
+                return {element_id: responses["pump_command"]}
 
-        # No override means run native logic.
+        if self.cfg.get("type") == "valve":
+            if "override_action" in responses:
+                return {element_id: responses["override_action"]}
+            if "valve_setting" in responses:
+                return {element_id: responses["valve_setting"]}
+
         return {element_id: "AUTO"}
-
-        return {}

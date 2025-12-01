@@ -21,6 +21,13 @@ class ScadaServer:
         plc_id = request.get("plc_id")
         role = request.get("role")
         observations = request.get("observations", {})
+        current_time = request.get("time", 0)
+
+        # Demo override window: force PLC_PUMP_1 OFF between 10000s and 15000s.
+        if 10000 < current_time < 15000:
+            self.overrides["PLC_PUMP_1"] = "OFF"
+        else:
+            self.overrides.pop("PLC_PUMP_1", None)
 
         cfg = self._find_plc_cfg(plc_id)
         if cfg is None:
@@ -40,7 +47,7 @@ class ScadaServer:
                 if plc_id in self.overrides:
                     resp["override_action"] = self.overrides[plc_id]
                 elif cmd is not None:
-                    resp["override_action"] = cmd
+                    resp["pump_command"] = cmd
                 return {"plc_id": plc_id, "responses": resp}
 
             if cfg.get("type") == "valve":
@@ -52,7 +59,7 @@ class ScadaServer:
                 if plc_id in self.overrides:
                     resp["override_action"] = self.overrides[plc_id]
                 elif setting is not None:
-                    resp["override_action"] = setting
+                    resp["valve_setting"] = setting
                 return {"plc_id": plc_id, "responses": resp}
 
         return {"plc_id": plc_id, "responses": {}, "error": "unknown_role"}
