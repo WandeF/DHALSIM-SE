@@ -39,10 +39,9 @@ class ScadaServer:
 
         if role == "actuator":
             if cfg.get("type") == "pump":
-                cmd = self._dispatch_pump_logic(cfg, observations)
-                self.pump_commands[cfg["element_id"]] = cmd if cmd is not None else self.pump_commands.get(
-                    cfg["element_id"]
-                )
+                cmd = self._dispatch_actuator_logic(cfg, observations)
+                if cmd is not None:
+                    self.pump_commands[cfg["element_id"]] = cmd
                 resp = {}
                 if plc_id in self.overrides:
                     resp["override_action"] = self.overrides[plc_id]
@@ -51,15 +50,14 @@ class ScadaServer:
                 return {"plc_id": plc_id, "responses": resp}
 
             if cfg.get("type") == "valve":
-                setting = self._dispatch_valve_logic(cfg, observations)
-                self.valve_commands[cfg["element_id"]] = setting if setting is not None else self.valve_commands.get(
-                    cfg["element_id"]
-                )
+                cmd = self._dispatch_actuator_logic(cfg, observations)
+                if cmd is not None:
+                    self.valve_commands[cfg["element_id"]] = cmd
                 resp = {}
                 if plc_id in self.overrides:
                     resp["override_action"] = self.overrides[plc_id]
-                elif setting is not None:
-                    resp["valve_setting"] = setting
+                elif cmd is not None:
+                    resp["valve_setting"] = cmd
                 return {"plc_id": plc_id, "responses": resp}
 
         return {"plc_id": plc_id, "responses": {}, "error": "unknown_role"}
@@ -83,48 +81,29 @@ class ScadaServer:
             if level is not None:
                 self.latest_sensors[cfg["element_id"]] = float(level)
 
-    def _dispatch_pump_logic(self, cfg: Dict, observations: Dict) -> str:
+    def _dispatch_actuator_logic(self, cfg: Dict, observations: Dict):
+        """
+        Map INP-derived control patterns to simple modes:
+        open_if_below / close_if_below / open_if_above / close_if_above.
+        """
         logic = cfg.get("logic", {})
         mode = logic.get("mode")
-        if mode == "native_inp":
-            return None
-        if mode != "on_if_tank_low":
-            return "ON"
+        node_id = logic.get("node_id")
+        threshold = float(logic.get("threshold", 0))
 
-        tank_id = logic.get("tank_id")
-        low = float(logic.get("low_level", 0))
-        high = float(logic.get("high_level", low))
-
-        # Prefer local observation; fall back to last SCADA view.
-        level = observations.get("tank_level")
-        if level is None and tank_id:
-            level = self.latest_sensors.get(tank_id)
-
+        # Use current observation; fall back to last known sensor value.
+        level = observations.get("level")
+        if level is None and node_id:
+            level = self.latest_sensors.get(node_id)
         if level is None:
-            return "ON"
-
-        level = float(level)
-        if level < low:
-            return "ON"
-        if level > high:
-            return "OFF"
-        # Keep last command to avoid chatter.
-        return self.pump_commands.get(cfg["element_id"], "ON")
-
-    def _dispatch_valve_logic(self, cfg: Dict, observations: Dict) -> float:
-        logic = cfg.get("logic", {})
-        mode = logic.get("mode")
-        if mode == "native_inp":
             return None
-        if mode != "open_if_pressure_high":
-            return 1.0
 
-        threshold = float(logic.get("pressure_threshold", 0))
-        junction_id = logic.get("junction_id")
-
-        pressure_map = observations.get("pressures") or {}
-        local_pressure = pressure_map.get(junction_id)
-        if local_pressure is None:
-            return 1.0 if threshold <= 0 else 0.0
-
-        return 1.0 if float(local_pressure) > threshold else 0.0
+        if mode == "open_if_below":
+            return "OPEN" if level < threshold else "CLOSED"
+        if mode == "close_if_below":
+            return "CLOSED" if level < threshold else "OPEN"
+        if mode == "open_if_above":
+            return "OPEN" if level > threshold else "CLOSED"
+        if mode == "close_if_above":
+            return "CLOSED" if level > threshold else "OPEN"
+        return None

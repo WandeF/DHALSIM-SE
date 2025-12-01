@@ -16,6 +16,10 @@ class PhysicalSimulator:
     duration/step, then each step() simply reads the current timestep from the
     stored WNTR results. Tank levels are derived from node head minus elevation
     (never from static init_level).
+
+    TODO: Move to a closed-loop variant where PLC/SCADA commands are applied to
+    pump/valve status and a short hydraulic segment is re-run each step. That
+    will require calling the EPANET toolkit or re-seeding WNTR with user_status.
     """
 
     def __init__(self, inp_path: str, duration_hours: float, step_minutes: float) -> None:

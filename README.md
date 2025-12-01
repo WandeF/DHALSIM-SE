@@ -15,3 +15,11 @@ Minimal co-simulation skeleton for a water distribution CPS using WNTR for the p
 - Placeholder attack hook under `attacks/`.
 
 This version keeps PLC–SCADA exchanges in-process for simplicity; you can later swap in real TCP flows over Mininet by reusing the same message format.
+
+## PLC configuration model
+- User-facing `config/plc_config.yaml` is intentionally minimal: PLC id, element_id, and IP.
+- At runtime we parse the INP `[CONTROLS]` (see `config/runtime_plc_builder.py` and `physical/controls_parser.py`) to infer roles/types/logic modes (`open_if_below/above`, `close_if_below/above`) and synthesize any missing sensor PLCs.
+- The expanded PLC config is what SCADA/PLC logic consumes during simulation.
+
+## Closed-loop roadmap
+- `physical/physical_sim.py` currently reads from a precomputed WNTR trajectory (open-loop). It exposes `apply_actuator_commands` and notes where EPANET user_status updates would be applied when moving to a per-step closed-loop hydraulic run.

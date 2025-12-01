@@ -53,26 +53,25 @@ class PlcLogic:
         element_id = self.cfg.get("element_id")
 
         observations: Dict = {}
-        if role == "sensor" and self.cfg.get("type") == "tank":
-            level = physical_state.get("tanks", {}).get(element_id)
+        logic = self.cfg.get("logic", {})
+
+        # Sensor PLC: report its node value.
+        if role == "sensor":
+            node_id = logic.get("node_id") or element_id
+            level = physical_state.get("tanks", {}).get(node_id)
             if level is not None:
-                observations["tank_level"] = float(level)
+                observations["level"] = float(level)
 
         if role == "actuator":
-            if self.cfg.get("type") == "pump":
-                tank_id = self.cfg.get("logic", {}).get("tank_id")
-                if tank_id:
-                    level = physical_state.get("tanks", {}).get(tank_id)
+            if logic:
+                node_id = logic.get("node_id")
+                if node_id:
+                    level = physical_state.get("tanks", {}).get(node_id)
                     if level is not None:
-                        observations["tank_level"] = float(level)
+                        observations["level"] = float(level)
                 observations["current_status"] = physical_state.get("pumps", {}).get(
                     element_id
-                )
-            if self.cfg.get("type") == "valve":
-                observations["pressures"] = physical_state.get("pressures", {})
-                observations["current_setting"] = physical_state.get("valves", {}).get(
-                    element_id
-                )
+                ) or physical_state.get("valves", {}).get(element_id)
 
         request = {
             "plc_id": plc_id,
