@@ -1,0 +1,24 @@
+scada:
+  ip: "10.0.0.10"
+  port: 5020
+
+plcs:
+  - id: "PLC_PUMP_1"
+    role: "actuator"
+    type: "pump"
+    element_id: "PUMP1"      
+    ip: "10.0.0.1"
+    logic:
+      mode: "on_if_tank_low"
+      tank_id: "TANK"        
+      low_level: 1.0
+      high_level: 4.0
+
+  - id: "PLC_TANK_1"
+    role: "sensor"
+    type: "tank"
+    element_id: "TANK"
+    ip: "10.0.0.3"
+    logic:
+      mode: "report_level"
+      report_interval_steps: 1

@@ -1,0 +1,10 @@
+simulation:
+  duration_hours: 12
+  step_minutes: 5
+  start_clock_time: "00:00"
+
+network:
+  use_minicps: false
+  link_delay_ms: 5
+  link_bandwidth_mbps: 10
+  loss_rate: 0.0

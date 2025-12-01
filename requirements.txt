@@ -1,0 +1,8 @@
+wntr>=0.4.1
+pyyaml>=6.0.1
+matplotlib>=3.8.0
+
+# Notes:
+# - Mininet is typically installed via apt or from source:
+#     sudo apt install mininet
+# - MiniCPS is not published on PyPI; pull from the upstream repo if you want full fidelity.
