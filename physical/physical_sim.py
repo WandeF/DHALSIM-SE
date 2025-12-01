@@ -1,25 +1,24 @@
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from wntr.network import WaterNetworkModel
 from wntr.sim import WNTRSimulator
+from wntr.epanet import toolkit as enData
+from wntr.epanet.util import EN
+
 
 logger = logging.getLogger(__name__)
 
 
-class PhysicalSimulator:
+
+class ClosedLoopPhysicalSimulator:
     """
-    Step-based wrapper around a precomputed WNTR simulation.
+    Closed-loop, step-wise EPANET toolkit simulation.
 
-    We run a full EPANET simulation once in initialize() using the configured
-    duration/step, then each step() simply reads the current timestep from the
-    stored WNTR results. Tank levels are derived from node head minus elevation
-    (never from static init_level).
-
-    TODO: Move to a closed-loop variant where PLC/SCADA commands are applied to
-    pump/valve status and a short hydraulic segment is re-run each step. That
-    will require calling the EPANET toolkit or re-seeding WNTR with user_status.
+    PLC/SCADA commands are applied to link status before each hydraulic step,
+    then ENrunH/ENnextH advance the hydraulics. 不再手动改 tank level，
+    一切由 EPANET 自己算。
     """
 
     def __init__(self, inp_path: str, duration_hours: float, step_minutes: float) -> None:
@@ -29,138 +28,159 @@ class PhysicalSimulator:
         self.step_seconds = int(step_minutes * 60)
         self.duration_seconds = int(duration_hours * 3600)
 
-        self.current_time = 0
-        self.step_idx = 0
+        self.current_time_s = 0.0
+        self.finished = False
 
-        self.results = None
-        self.time_index: List[int] = []
-
-        # Cached lists for convenience.
         self.tank_ids: List[str] = []
         self.pump_ids: List[str] = []
         self.valve_ids: List[str] = []
+        self.link_name_to_index: Dict[str, int] = {}
+        self.node_name_to_index: Dict[str, int] = {}
 
-        # Commands are cached for logging only; hydraulics are open-loop.
         self.pump_commands: Dict[str, str] = {}
         self.valve_commands: Dict[str, float] = {}
 
-        # Last known physical states for reference/logging.
-        self.last_tank_levels: Dict[str, float] = {}
-        self.last_pump_states: Dict[str, str] = {}
-        self.last_valve_settings: Dict[str, float] = {}
-
-        # Base model used for elevations and element metadata.
-        self._base_model: WaterNetworkModel | None = None
+        # EPANET engine handle，会在 initialize 里真正打开
+        self._en = enData.ENepanet()
 
     def initialize(self) -> None:
         if not self.inp_path.exists():
             raise FileNotFoundError(f"Missing EPANET file: {self.inp_path}")
 
-        model = WaterNetworkModel(str(self.inp_path))
-        model.options.time.duration = self.duration_seconds
-        model.options.time.hydraulic_timestep = self.step_seconds
-        model.options.time.report_timestep = self.step_seconds
+        # 打开 EPANET 工具箱引擎
+        self._en.ENopen(str(self.inp_path), "closed_loop.rpt", "")
 
-        sim = WNTRSimulator(model)
-        self.results = sim.run_sim()
-        self.time_index = list(getattr(self.results, "time", []))
+        self._en.ENsettimeparam(EN.DURATION, int(self.duration_seconds))
+        self._en.ENsettimeparam(EN.HYDSTEP, int(self.step_seconds))
+        self._en.ENsettimeparam(EN.REPORTSTEP, int(self.step_seconds))
+        self._en.ENsettimeparam(EN.REPORTSTART, 0)
 
-        self.tank_ids = model.tank_name_list
-        self.pump_ids = model.pump_name_list
-        self.valve_ids = model.valve_name_list
-        self._base_model = model
+        # 用 WNTR 读网络，拿到 ID 列表
+        wn = WaterNetworkModel(str(self.inp_path))
+        self.tank_ids = wn.tank_name_list
+        self.pump_ids = wn.pump_name_list
+        self.valve_ids = wn.valve_name_list
 
-        # Initialize last-known states from the first timestep of results.
-        if self.time_index:
-            t0 = self.time_index[0]
-            self.last_tank_levels = self._read_tank_levels(t0)
-            self.last_pump_states = self._extract_status(self.results, t0, self.pump_ids, {})
-            self.last_valve_settings = self._extract_setting(self.results, t0, self.valve_ids, {})
+        # 建立 name -> index 映射表，方便后续 ENgetlinkvalue/ENgetnodevalue
+        for lid in wn.link_name_list:
+            idx = self._en.ENgetlinkindex(lid)
+            self.link_name_to_index[lid] = idx
+        for nid in wn.node_name_list:
+            idx = self._en.ENgetnodeindex(nid)
+            self.node_name_to_index[nid] = idx
 
-        logger.info(
-            "Loaded network %s (duration=%ss, step=%ss, timesteps=%d)",
-            self.inp_path,
-            self.duration_seconds,
-            self.step_seconds,
-            len(self.time_index),
-        )
+        # 打开水力分析
+        self._en.ENopenH()
+        # 0 表示从当前时间开始
+        self._en.ENinitH(0)
+
+        self.current_time_s = 0.0
+        self.finished = False
+        logger.info("Closed-loop: opened EPANET toolkit for %s", self.inp_path)
 
     def apply_actuator_commands(
         self, pump_commands: Dict[str, str], valve_commands: Dict[str, float]
     ) -> None:
         """
-        Open-loop note: physical hydraulics are precomputed from the INP controls.
-        We cache commands for logging/analysis only; they do NOT alter the stored
-        WNTR results. To close the loop, rerun hydraulics each step with commands.
+        在下一步 ENrunH 之前，把 PLC/SCADA 的控制命令写到 EPANET 的 link status 里。
         """
         self.pump_commands = pump_commands.copy()
         self.valve_commands = valve_commands.copy()
 
-    def step(self) -> Dict:
+        # Pumps
+        for pump_id, cmd in self.pump_commands.items():
+            idx = self.link_name_to_index.get(pump_id)
+            if idx is None:
+                continue
+            status = 1.0 if str(cmd).upper() in {"ON", "OPEN", "1", "TRUE"} else 0.0
+            self._en.ENsetlinkvalue(idx, EN.STATUS, status)
+
+        # Valves
+        for valve_id, cmd in self.valve_commands.items():
+            idx = self.link_name_to_index.get(valve_id)
+            if idx is None:
+                continue
+            status = 1.0 if str(cmd).upper() in {"ON", "OPEN", "1", "TRUE"} else 0.0
+            self._en.ENsetlinkvalue(idx, EN.STATUS, status)
+
+    def step(self) -> Optional[Dict]:
         """
-        Return the snapshot at the current timestep from precomputed results.
+        推进一步水力模型，并返回这一时刻的物理快照。
         """
-        if self.results is None or not self.time_index:
-            raise RuntimeError("Call initialize() before stepping the simulator.")
+        if self.finished:
+            return None
 
-        if self.step_idx >= len(self.time_index):
-            return {
-                "time": self.current_time,
-                "tanks": {},
-                "pumps": {},
-                "valves": {},
-                "pressures": {},
-            }
+        # 返回当前时间（秒）
+        t = self._en.ENrunH()
+        self.current_time_s = float(t)
 
-        t = self.time_index[self.step_idx]
-        tanks = self._read_tank_levels(t)
-        pumps = self._extract_status(self.results, t, self.pump_ids, {})
-        valves = self._extract_setting(self.results, t, self.valve_ids, {})
+        tanks: Dict[str, float] = {}
+        pumps: Dict[str, str] = {}
+        valves: Dict[str, str] = {}
 
-        self.last_tank_levels = tanks
-        self.last_pump_states = pumps
-        self.last_valve_settings = valves
+        # 读水箱水位：head - elevation
+        for tank_id in self.tank_ids:
+            nidx = self.node_name_to_index.get(tank_id)
+            if nidx is None:
+                continue
+            head = float(self._en.ENgetnodevalue(nidx, EN.HEAD))
+            elev = float(self._en.ENgetnodevalue(nidx, EN.ELEVATION))
+            level = head - elev
+            if level < 0:
+                level = 0.0  # 简单防一下数值小负数
+            tanks[tank_id] = level
+
+        # 读水泵状态
+        for pump_id in self.pump_ids:
+            lidx = self.link_name_to_index.get(pump_id)
+            if lidx is None:
+                continue
+            status = float(self._en.ENgetlinkvalue(lidx, EN.STATUS))
+            pumps[pump_id] = "ON" if status > 0.5 else "OFF"
+
+        # 读阀门状态
+        for valve_id in self.valve_ids:
+            lidx = self.link_name_to_index.get(valve_id)
+            if lidx is None:
+                continue
+            status = float(self._en.ENgetlinkvalue(lidx, EN.STATUS))
+            valves[valve_id] = "OPEN" if status > 0.5 else "CLOSED"
 
         snapshot = {
-            "time": t,
+            "time": self.current_time_s,
             "tanks": tanks,
-            "pressures": {},  # extend if needed
             "pumps": pumps,
             "valves": valves,
         }
+        # 推进到下一个时间步
+        tstep = self._en.ENnextH()
+        # tstep == 0 表示仿真结束
+        if tstep <= 0 or self.current_time_s >= self.duration_seconds:
+            self.finished = True
+            self.close()
 
-        self.step_idx += 1
-        self.current_time = t
         return snapshot
 
-    def _read_tank_levels(self, t) -> Dict[str, float]:
-        levels: Dict[str, float] = {}
-        if self.results is None or self._base_model is None:
-            return levels
-        heads = self.results.node["head"]
-        for tank_id in self.tank_ids:
-            if tank_id not in heads.columns:
-                continue
-            head = heads.loc[t, tank_id]
-            elevation = float(self._base_model.get_node(tank_id).elevation)
-            levels[tank_id] = float(head - elevation)
-        return levels
+    def close(self) -> None:
+        try:
+            self._en.ENcloseH()
+        except Exception:
+            pass
+        try:
+            self._en.ENclose()
+        except Exception:
+            pass
 
-    @staticmethod
-    def _extract_status(results, ts, ids, fallback: Dict[str, str]) -> Dict[str, str]:
-        if not ids:
-            return {}
-        status_frame = results.link.get("status")
-        if status_frame is None:
-            return fallback
-        data = status_frame.loc[ts, ids].to_dict()
-        return {k: ("ON" if int(v) else "OFF") for k, v in data.items()}
 
-    @staticmethod
-    def _extract_setting(results, ts, ids, fallback: Dict[str, float]) -> Dict[str, float]:
-        if not ids:
-            return {}
-        setting_frame = results.link.get("setting")
-        if setting_frame is None:
-            return fallback
-        return setting_frame.loc[ts, ids].to_dict()
+
+def make_physical_simulator(inp_path: Path, sim_cfg: Dict) -> object:
+    mode = sim_cfg["simulation"].get("mode", "closed_loop")
+    # if mode == "open_loop":
+    #     logger.info("Running simulation in OPEN-LOOP mode (precomputed trajectory).")
+    #     return OpenLoopPhysicalSimulator(
+    #         inp_path, sim_cfg["simulation"]["duration_hours"], sim_cfg["simulation"]["step_minutes"]
+    #     )
+    # logger.info("Running simulation in CLOSED-LOOP mode (EPANET toolkit step-wise, no network).")
+    return ClosedLoopPhysicalSimulator(
+        inp_path, sim_cfg["simulation"]["duration_hours"], sim_cfg["simulation"]["step_minutes"]
+    )

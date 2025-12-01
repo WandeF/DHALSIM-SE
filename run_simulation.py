@@ -11,7 +11,7 @@ from ics_network.plc_node import PlcLogic
 from ics_network.scada_node import ScadaServer
 from ics_network.topology import WaterCpsTopology
 from config.runtime_plc_builder import build_runtime_plc_config
-from physical.physical_sim import PhysicalSimulator
+from physical.physical_sim import make_physical_simulator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 warnings.filterwarnings("ignore")
@@ -61,11 +61,7 @@ def main() -> None:
     inp_path = repo_root / "water_network" / "minitown.inp"
     plc_cfg = build_runtime_plc_config(user_plc_cfg, inp_path)
 
-    phys = PhysicalSimulator(
-        inp_path=inp_path,
-        duration_hours=sim_cfg["simulation"]["duration_hours"],
-        step_minutes=sim_cfg["simulation"]["step_minutes"],
-    )
+    phys = make_physical_simulator(inp_path, sim_cfg)
     phys.initialize()
 
     output_dir = prepare_output_dir(Path(phys.inp_path), repo_root)
@@ -108,23 +104,32 @@ def main() -> None:
     actuator_plcs = list(actuator_plc_by_elem.values())
     rows: List[Dict] = []
 
-    for step in range(total_steps):
-        physical_state = phys.step()
+    # Initial commands applied before first hydraulic step.
+    pump_commands: Dict[str, str] = {}
+    valve_commands: Dict[str, float] = {}
+    phys.apply_actuator_commands(pump_commands, valve_commands)
 
+    for step in range(total_steps):
+        # 1) Apply commands from previous iteration (already set) and advance hydraulics.
+        physical_state = phys.step()
+        if physical_state is None:
+            break
+
+        # 2) PLC/SCADA on current snapshot.
         for plc_id, plc_logic in plc_logics.items():
             request = plc_logic.build_request(physical_state)
             reply = scada.handle_plc_request(request)
             plc_logic.update_from_scada_reply(reply)
 
-        pump_commands: Dict[str, str] = {}
-        valve_commands: Dict[str, float] = {}
+        # 3) Aggregate next commands.
+        pump_commands = {}
+        valve_commands = {}
         pump_seen = set()
         valve_seen = set()
         for plc in plc_cfg.get("plcs", []):
             logic = plc_logics[plc["id"]]
             effect = logic.get_actuator_effect()
             if plc.get("type") == "pump":
-                # Avoid duplicate PLC entries for the same element.
                 elem = plc.get("element_id")
                 if elem in pump_seen:
                     continue
@@ -137,15 +142,16 @@ def main() -> None:
                 valve_seen.add(elem)
                 valve_commands.update(effect)
 
-        phys.apply_actuator_commands(pump_commands, valve_commands)
         logger.info(
-            "Step %d/%d: t=%ss pumps=%s valves=%s tanks=%s",
+            "Step %d/%d: t=%ss pumps=%s valves=%s tanks=%s next_pump_cmds=%s next_valve_cmds=%s",
             step + 1,
             total_steps,
             physical_state.get("time"),
             physical_state.get("pumps", {}),
             physical_state.get("valves", {}),
             physical_state.get("tanks", {}),
+            pump_commands,
+            valve_commands,
         )
 
         row = {"time_s": physical_state.get("time")}
@@ -157,8 +163,15 @@ def main() -> None:
             row[f"valve_{vid}"] = physical_state.get("valves", {}).get(vid)
         rows.append(row)
 
+        # 4) Apply commands for next hydraulic step.
+        phys.apply_actuator_commands(pump_commands, valve_commands)
+
     if topo is not None:
         topo.stop()
+    try:
+        phys.close()
+    except Exception:
+        pass
     logger.info("Simulation complete.")
 
     if rows:
