@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict
+import logging
+from typing import Dict, Any
+
+from wntr.network import WaterNetworkModel
+
+logger = logging.getLogger(__name__)
 
 
 class PlcLogic:
@@ -9,10 +14,38 @@ class PlcLogic:
     physical snapshot, then stores SCADA responses for later actuator updates.
     """
 
-    def __init__(self, plc_cfg: Dict) -> None:
+    def __init__(self, plc_cfg: Dict, inp_path: str | None = None) -> None:
         self.cfg = plc_cfg
         self.last_reply: Dict = {}
         self.cached_request: Dict = {}
+        self.native_logic: Dict[str, Any] = {}
+
+        if inp_path:
+            try:
+                model = WaterNetworkModel(str(inp_path))
+                target_id = plc_cfg.get("element_id")
+                # Collect controls and rules that involve this actuator.
+                controls = []
+                for ctl_name in getattr(model, "control_name_list", []) or []:
+                    ctl = model.get_control(ctl_name)
+                    ctl_str = str(ctl)
+                    if target_id and target_id in ctl_str:
+                        controls.append(ctl_str)
+                rules = []
+                for rule in getattr(model, "rules", []) or []:
+                    rule_str = str(rule)
+                    if target_id and target_id in rule_str:
+                        rules.append(rule_str)
+                self.native_logic = {"controls": controls, "rules": rules}
+                if controls or rules:
+                    logger.info(
+                        "PLC %s initialized with native logic targeting %s: %s",
+                        plc_cfg.get("id"),
+                        target_id,
+                        self.native_logic,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to load native logic for %s: %s", plc_cfg.get("id"), exc)
 
     def build_request(self, physical_state: Dict) -> Dict:
         plc_id = self.cfg.get("id")
@@ -64,14 +97,11 @@ class PlcLogic:
         element_id = self.cfg.get("element_id")
         responses = self.last_reply.get("responses", {})
 
-        if self.cfg.get("type") == "pump":
-            cmd = responses.get("pump_command")
-            if cmd is not None:
-                return {element_id: str(cmd)}
+        override = responses.get("override_action")
+        if override is not None:
+            return {element_id: override}
 
-        if self.cfg.get("type") == "valve":
-            setting = responses.get("valve_setting")
-            if setting is not None:
-                return {element_id: float(setting)}
+        # No override means run native logic.
+        return {element_id: "AUTO"}
 
         return {}

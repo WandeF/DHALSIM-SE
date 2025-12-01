@@ -76,6 +76,8 @@ class PhysicalSimulator:
         model = WaterNetworkModel(str(self.inp_path))
         model.options.time.duration = self.step_seconds
         model.options.time.hydraulic_timestep = self.step_seconds
+        # Force reporting at each simulation step so we read the end-of-step state.
+        model.options.time.report_timestep = self.step_seconds
 
         self._apply_commands_to_model(model)
         self._apply_tank_levels(model)
@@ -116,16 +118,45 @@ class PhysicalSimulator:
         }
 
     def _apply_commands_to_model(self, model: WaterNetworkModel) -> None:
+        # Pumps
         for pump_id, status in self.pump_commands.items():
+            if str(status).upper() == "AUTO":
+                continue  # native INP logic governs
+
+            # Remove native controls affecting this pump for this step
+            for ctl_name in list(getattr(model, "control_name_list", []) or []):
+                try:
+                    ctl = model.get_control(ctl_name)
+                    if pump_id in str(ctl):
+                        model.remove_control(ctl_name)
+                except Exception:
+                    continue
+
             link = model.get_link(pump_id)
             state = 1 if str(status).upper() in {"OPEN", "ON", "1"} else 0
             link.initial_status = state
 
+        # Valves
         for valve_id, setting in self.valve_commands.items():
+            if str(setting).upper() == "AUTO":
+                continue
+
+            for ctl_name in list(getattr(model, "control_name_list", []) or []):
+                try:
+                    ctl = model.get_control(ctl_name)
+                    if valve_id in str(ctl):
+                        model.remove_control(ctl_name)
+                except Exception:
+                    continue
+
             link = model.get_link(valve_id)
-            link.initial_setting = float(setting)
             try:
-                link.setting = float(setting)
+                val = float(setting)
+            except (TypeError, ValueError):
+                val = 0.0
+            link.initial_setting = val
+            try:
+                link.setting = val
             except AttributeError:
                 pass
 

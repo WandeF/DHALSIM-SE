@@ -15,6 +15,7 @@ class ScadaServer:
 
         self.pump_commands: Dict[str, str] = {}
         self.valve_commands: Dict[str, float] = {}
+        self.overrides: Dict[str, str] = {}
 
     def handle_plc_request(self, request: Dict) -> Dict:
         plc_id = request.get("plc_id")
@@ -32,13 +33,27 @@ class ScadaServer:
         if role == "actuator":
             if cfg.get("type") == "pump":
                 cmd = self._dispatch_pump_logic(cfg, observations)
-                self.pump_commands[cfg["element_id"]] = cmd
-                return {"plc_id": plc_id, "responses": {"pump_command": cmd}}
+                self.pump_commands[cfg["element_id"]] = cmd if cmd is not None else self.pump_commands.get(
+                    cfg["element_id"]
+                )
+                resp = {}
+                if plc_id in self.overrides:
+                    resp["override_action"] = self.overrides[plc_id]
+                elif cmd is not None:
+                    resp["override_action"] = cmd
+                return {"plc_id": plc_id, "responses": resp}
 
             if cfg.get("type") == "valve":
                 setting = self._dispatch_valve_logic(cfg, observations)
-                self.valve_commands[cfg["element_id"]] = setting
-                return {"plc_id": plc_id, "responses": {"valve_setting": setting}}
+                self.valve_commands[cfg["element_id"]] = setting if setting is not None else self.valve_commands.get(
+                    cfg["element_id"]
+                )
+                resp = {}
+                if plc_id in self.overrides:
+                    resp["override_action"] = self.overrides[plc_id]
+                elif setting is not None:
+                    resp["override_action"] = setting
+                return {"plc_id": plc_id, "responses": resp}
 
         return {"plc_id": plc_id, "responses": {}, "error": "unknown_role"}
 
@@ -64,6 +79,8 @@ class ScadaServer:
     def _dispatch_pump_logic(self, cfg: Dict, observations: Dict) -> str:
         logic = cfg.get("logic", {})
         mode = logic.get("mode")
+        if mode == "native_inp":
+            return None
         if mode != "on_if_tank_low":
             return "ON"
 
@@ -90,6 +107,8 @@ class ScadaServer:
     def _dispatch_valve_logic(self, cfg: Dict, observations: Dict) -> float:
         logic = cfg.get("logic", {})
         mode = logic.get("mode")
+        if mode == "native_inp":
+            return None
         if mode != "open_if_pressure_high":
             return 1.0
 

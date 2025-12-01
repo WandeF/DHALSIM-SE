@@ -43,8 +43,9 @@ def main() -> None:
     plc_cfg = load_yaml(repo_root / "config" / "plc_config.yaml")
     sim_cfg = load_yaml(repo_root / "config" / "sim_config.yaml")
 
+    inp_path = repo_root / "water_network" / "minitown.inp"
     phys = PhysicalSimulator(
-        inp_path=repo_root / "water_network" / "minitown.inp",
+        inp_path=inp_path,
         duration_hours=sim_cfg["simulation"]["duration_hours"],
         step_minutes=sim_cfg["simulation"]["step_minutes"],
     )
@@ -54,7 +55,7 @@ def main() -> None:
     logger.info("Output directory: %s", output_dir)
 
     scada = ScadaServer(plc_cfg)
-    plc_logics = {plc["id"]: PlcLogic(plc) for plc in plc_cfg.get("plcs", [])}
+    plc_logics = {plc["id"]: PlcLogic(plc, inp_path=inp_path) for plc in plc_cfg.get("plcs", [])}
 
     network_cfg = sim_cfg.get("network", {})
     use_minicps = network_cfg.get("use_minicps", False)
@@ -71,9 +72,16 @@ def main() -> None:
     )
     logger.info("Starting co-simulation for %d steps", total_steps)
 
-    pump_ids = [plc["element_id"] for plc in plc_cfg.get("plcs", []) if plc.get("type") == "pump"]
-    valve_ids = [plc["element_id"] for plc in plc_cfg.get("plcs", []) if plc.get("type") == "valve"]
-    tank_ids = [plc["element_id"] for plc in plc_cfg.get("plcs", []) if plc.get("type") == "tank"]
+    pump_ids = []
+    valve_ids = []
+    tank_ids = []
+    for plc in plc_cfg.get("plcs", []):
+        if plc.get("type") == "pump":
+            pump_ids.append(plc.get("element_id"))
+        if plc.get("type") == "valve":
+            valve_ids.append(plc.get("element_id"))
+        if plc.get("type") == "tank":
+            tank_ids.append(plc.get("element_id"))
     rows: List[Dict] = []
 
     for step in range(total_steps):
@@ -100,8 +108,8 @@ def main() -> None:
             step + 1,
             total_steps,
             physical_state.get("time"),
-            pump_commands,
-            valve_commands,
+            physical_state.get("pumps", {}),
+            physical_state.get("valves", {}),
             physical_state.get("tanks", {}),
         )
 
@@ -109,9 +117,9 @@ def main() -> None:
         for tid in tank_ids:
             row[f"tank_{tid}"] = physical_state.get("tanks", {}).get(tid)
         for pid in pump_ids:
-            row[f"pump_{pid}"] = pump_commands.get(pid)
+            row[f"pump_{pid}"] = physical_state.get("pumps", {}).get(pid)
         for vid in valve_ids:
-            row[f"valve_{vid}"] = valve_commands.get(vid)
+            row[f"valve_{vid}"] = physical_state.get("valves", {}).get(vid)
         rows.append(row)
 
     if topo is not None:

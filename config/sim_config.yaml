@@ -1,5 +1,5 @@
 simulation:
-  duration_hours: 12
+  duration_hours: 24
   step_minutes: 5
   start_clock_time: "00:00"
 
